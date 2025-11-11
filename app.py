@@ -31,7 +31,7 @@ LABEL_BOLD = True             # bold for label lines
 
 # ========================= Setup / Helpers =========================
 
-st.set_page_config(page_title="Amazon Top-20 → Micro Center Matcher (Persistent)", layout="wide")
+st.set_page_config(page_title="Amazon Top-20 Scraper with Unified Excel Exporter", layout="wide")
 # === THEME SELECTION ===
 st.sidebar.markdown("### 🧥 Theme Mode")
 theme = st.sidebar.radio("Choose theme:", ["Light", "Dark", "Flannel"], index=1)
