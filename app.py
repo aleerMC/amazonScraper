@@ -73,6 +73,8 @@ def extract_asin_from_url(url: str):
     return None
 
 def parse_top20_from_category_page(url, session=None):
+    """Collect the first 20 unique ASINs on the Best Sellers page.
+       Also resolve intermediary redirect links to the final product URL."""
     session = session or _session()
     soup, final_url = get_soup(url, session)
     anchors = soup.find_all("a", href=True)
@@ -82,6 +84,8 @@ def parse_top20_from_category_page(url, session=None):
         asin = extract_asin_from_url(href)
         if not asin or asin in seen_asins:
             continue
+
+        # best-effort title
         title = (a.get_text(strip=True) or "").strip()
         if not title:
             img = a.find("img", alt=True)
@@ -89,7 +93,18 @@ def parse_top20_from_category_page(url, session=None):
                 title = img["alt"].strip()
         if not title and a.get("title"):
             title = a["title"].strip()
+
+        # absolute URL
         item_url = urljoin(final_url, href) if href.startswith("/") else href
+
+        # --- Resolve redirects (Amazon shortlinks) ---
+        try:
+            r = session.get(item_url, allow_redirects=True, timeout=10,
+                            headers={"User-Agent": random.choice(USER_AGENTS)})
+            item_url = r.url
+        except Exception:
+            pass
+
         seen_asins.add(asin)
         items.append({"ASIN": asin, "Title": title or "", "URL": item_url})
         if len(items) >= 20:
@@ -151,17 +166,34 @@ def extract_image_from_soup_amzn(soup):
                 return img.get(attr)
     return ""
 
-def fetch_item_details_amzn(item_url, session=None, retries=2, delay_range=(1.2, 2.4)):
+# --- improved: add random delay and retries for more stable images ---
+def fetch_item_details_amzn(item_url, session=None, retries=2, delay_range=(1.5, 3.0)):
     session = session or _session()
     for attempt in range(retries + 1):
         try:
             soup, _ = get_soup(item_url, session, timeout=20)
-            return extract_price_from_soup_amzn(soup), extract_image_from_soup_amzn(soup)
+            price = extract_price_from_soup_amzn(soup)
+            image = extract_image_from_soup_amzn(soup)
+            if image:
+                return price, image
+            time.sleep(random.uniform(*delay_range))
         except Exception:
             if attempt >= retries:
                 return "", ""
             time.sleep(random.uniform(*delay_range))
     return "", ""
+
+# --- cache image bytes to reduce dropped images on Streamlit Cloud ---
+@st.cache_data(ttl=3600)
+def load_image_bytes(url: str):
+    try:
+        if not url:
+            return None
+        resp = requests.get(url, headers={"User-Agent": random.choice(USER_AGENTS)}, timeout=10)
+        resp.raise_for_status()
+        return resp.content
+    except Exception:
+        return None
 
 # ========================= Micro Center (robust candidates & pricing) =========================
 
@@ -487,7 +519,6 @@ def load_run(run_id: str):
     df = pd.read_csv(_data_path(run_id), dtype=str).fillna("")
     with open(_meta_path(run_id), "r", encoding="utf-8") as f:
         meta = json.load(f)
-    # restore integer Rank if present
     if "Rank" in df.columns:
         with pd.option_context("mode.chained_assignment", None):
             df["Rank"] = pd.to_numeric(df["Rank"], errors="coerce").fillna(0).astype(int)
@@ -659,17 +690,6 @@ if fetch_btn:
 
 # ========================= Save Handlers =========================
 
-def new_run_meta(category_desc: str, amazon_url: str, fetched_at: str, name: Optional[str] = None):
-    now = utc_now_str()
-    return {
-        "name": name or (category_desc or "Top 20"),
-        "category_desc": category_desc or "",
-        "amazon_url": amazon_url or "",
-        "fetched_at": fetched_at or now,
-        "created_at": now,
-        "updated_at": now
-    }
-
 if save_new_btn and st.session_state.results is not None:
     run_id = uuid.uuid4().hex[:12]
     meta = new_run_meta(
@@ -729,10 +749,10 @@ if st.session_state.results is not None and not st.session_state.results.empty:
             a_cols = st.columns([1, 3])
             with a_cols[0]:
                 if isinstance(row["ImageURL"], str) and row["ImageURL"]:
-                    try:
-                        img_data = requests.get(row["ImageURL"], headers={"User-Agent": random.choice(USER_AGENTS)}, timeout=10).content
+                    img_data = load_image_bytes(row["ImageURL"])
+                    if img_data:
                         st.image(img_data, width=120)
-                    except Exception:
+                    else:
                         st.write("—")
                 else:
                     st.write("—")
@@ -754,10 +774,10 @@ if st.session_state.results is not None and not st.session_state.results.empty:
             with b_cols[0]:
                 mc_img_url = disp.get("MCImageURL", "")
                 if isinstance(mc_img_url, str) and mc_img_url:
-                    try:
-                        mc_img = requests.get(mc_img_url, headers={"User-Agent": random.choice(USER_AGENTS)}, timeout=10).content
+                    mc_img = load_image_bytes(mc_img_url)
+                    if mc_img:
                         st.image(mc_img, width=120)
-                    except Exception:
+                    else:
                         st.write("—")
                 else:
                     st.write("—")
@@ -859,6 +879,7 @@ if st.session_state.results is not None and not st.session_state.results.empty:
             resp = requests.get(url, headers={"User-Agent": random.choice(USER_AGENTS)}, timeout=15)
             resp.raise_for_status()
             img = PILImage.open(BytesIO(resp.content)).convert("RGBA")
+            img.load()  # force-load to avoid truncated JPEGs in some environments
             img.thumbnail((max_px, max_px), PILImage.LANCZOS)
             buff = BytesIO()
             img.save(buff, format="PNG")
