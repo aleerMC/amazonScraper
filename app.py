@@ -1,42 +1,37 @@
 import re
 import os
-import json
 import uuid
 import time
 import random
-from io import BytesIO
 from datetime import datetime, timezone
-from urllib.parse import urljoin, quote_plus, urlparse
-from typing import Optional
-
+from urllib.parse import urljoin, quote_plus
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
-
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+from openpyxl.styles import Alignment, PatternFill
 from openpyxl.utils import get_column_letter
-from openpyxl.drawing.image import Image as XLImage
-from PIL import Image as PILImage
 
-# ======================= BASIC SETUP =======================
-st.set_page_config(page_title="Amazon ⇄ Micro Center Matcher", layout="wide")
+# ======================== SETUP ========================
+st.set_page_config(
+    page_title="Amazon ⇄ Micro Center Matcher",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 SAVED_DIR = ".saved_searches"
 os.makedirs(SAVED_DIR, exist_ok=True)
 
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
 ]
 
-EXCEL_IMG_MAX_PX = 220
-EXCEL_IMG_ROW_HEIGHT = 90
-BAND_COLOR_1 = "FFFFFF"
-BAND_COLOR_2 = "F7F7F7"
-
-# ======================= UTILS =======================
+# ======================== HELPERS ========================
 def _session():
     s = requests.Session()
     s.headers.update({"Accept-Language": "en-US,en;q=0.9"})
@@ -49,10 +44,7 @@ def get_soup(url, session=None, timeout=15):
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser"), r.url
 
-def utc_now_str():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-# ======================= AMAZON SCRAPER =======================
+# ======================== AMAZON SCRAPER ========================
 ASIN_REGEXES = [
     re.compile(r"/dp/([A-Z0-9]{10})(?:[/?]|$)"),
     re.compile(r"/gp/product/([A-Z0-9]{10})(?:[/?]|$)"),
@@ -84,14 +76,11 @@ def parse_top20_from_category_page(url, session=None):
         if not title and a.get("title"):
             title = a["title"].strip()
         item_url = urljoin(final_url, href) if href.startswith("/") else href
-
-        # Resolve redirects
         try:
             r = session.get(item_url, allow_redirects=True, timeout=10)
             item_url = r.url
         except Exception:
             pass
-
         seen_asins.add(asin)
         items.append({"ASIN": asin, "Title": title or "", "URL": item_url})
         if len(items) >= 20:
@@ -99,12 +88,6 @@ def parse_top20_from_category_page(url, session=None):
     return items
 
 def extract_price_from_soup_amzn(soup):
-    for cid in ["priceblock_ourprice", "priceblock_dealprice", "priceblock_saleprice"]:
-        el = soup.find(id=cid)
-        if el:
-            off = el.find("span", class_="a-offscreen")
-            if off:
-                return off.get_text(strip=True)
     for off in soup.select("span.a-offscreen"):
         val = off.get_text(strip=True)
         if re.match(r"^\$", val):
@@ -149,9 +132,8 @@ def load_image_bytes(url):
     except Exception:
         return None
 
-# ======================= MICRO CENTER SCRAPER =======================
+# ======================== MICRO CENTER SCRAPER ========================
 def fetch_microcenter_info(sku):
-    """Improved Micro Center fetcher that ignores 'battery replacement' stub page"""
     base_url = f"https://www.microcenter.com/search/search_results.aspx?Ntt={quote_plus(str(sku))}"
     try:
         soup, _ = get_soup(base_url)
@@ -177,94 +159,103 @@ def fetch_microcenter_info(sku):
         return {}
     return {}
 
-# ======================= EXCEL EXPORT =======================
-def build_excel(df_amzn, df_mc):
+# ======================== EXCEL EXPORT ========================
+def build_excel(df_amzn):
     wb = Workbook()
     ws = wb.active
     ws.title = "Top 20"
-    ws.append(["Amazon Image", "Amazon Title", "Amazon Price", "Amazon Link",
-               "MC Image", "MC SKU", "MC Description", "MC Price",
-               "Attributes", "Notes"])
+    ws.append([
+        "Amazon Image", "Amazon Title", "Amazon Price", "Amazon Link",
+        "MC Image", "MC SKU", "MC Description", "MC Price",
+        "Attributes", "Notes"
+    ])
     ws.freeze_panes = "A2"
-
-    thin = Side(border_style="thin", color="DDDDDD")
     for i, row in enumerate(df_amzn.itertuples(), start=2):
-        band = BAND_COLOR_1 if i % 2 else BAND_COLOR_2
-        fill = PatternFill("solid", fgColor=band)
+        band = "FFFFFF" if i % 2 else "F7F7F7"
         ws.append(["", row.Title, row.Price, row.URL, "", "", "", "", "", ""])
         for j in range(1, 11):
-            ws.cell(i, j).fill = fill
+            ws.cell(i, j).fill = PatternFill("solid", fgColor=band)
             ws.cell(i, j).alignment = Alignment(wrap_text=True, vertical="top")
-
     for col in range(1, 11):
         ws.column_dimensions[get_column_letter(col)].width = 25
-
     return wb
 
-# ======================= SIDEBAR SETTINGS =======================
+# ======================== SIDEBAR SETTINGS ========================
 with st.sidebar.expander("⚙️ Settings", expanded=False):
     st.markdown("### Display & Speed Settings")
-
     theme = st.radio("Theme", ["Light", "Dark", "Flannel"], horizontal=True)
     delay = st.slider("Scrape Delay (sec)", 0.5, 5.0, 1.5, 0.5)
     retries = st.slider("Retry Count", 0, 4, 2, 1)
 
-# Apply theme CSS
+# ======================== THEME CSS ========================
 if theme == "Flannel":
     st.markdown(
-        f"""
+        """
         <style>
-        .stApp {{
+        .stApp {
             background-color: #1e1e1e;
+            position: relative;
+            overflow: hidden;
+        }
+        /* translucent plaid overlay */
+        .stApp::before {
+            content: "";
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
             background-image: url('rhythmicRed.png');
-            background-size: cover;
-            background-position: center;
-            background-repeat: no-repeat;
-        }}
-        section[data-testid="stSidebar"] > div:first-child {{
+            background-size: 400px auto;
+            background-repeat: repeat;
+            opacity: 0.25;
+            z-index: -1;
+        }
+        section[data-testid="stSidebar"] > div:first-child {
             background: linear-gradient(180deg,#2c0000 0%,#1e1e1e 100%);
             border-right: 1px solid #440000;
-        }}
-        h1,h2,h3,h4,h5,h6 {{ color: #ffdddd !important; }}
-        .stButton button {{
-            background: #660000; color:white; border:1px solid #992222; border-radius:8px;
-        }}
-        .stButton button:hover {{ background:#992222; }}
+        }
+        h1,h2,h3,h4,h5,h6 { color: #ffdddd !important; }
+        .stButton button {
+            background: #660000; color:white;
+            border:1px solid #992222; border-radius:8px;
+        }
+        .stButton button:hover { background:#992222; }
         </style>
-        """, unsafe_allow_html=True
+        """,
+        unsafe_allow_html=True,
     )
 elif theme == "Dark":
     st.markdown("<style>body{background-color:#0E1117;color:#FAFAFA;}</style>", unsafe_allow_html=True)
 else:
     st.markdown("<style>body{background-color:white;color:black;}</style>", unsafe_allow_html=True)
 
-# ======================= MAIN INTERFACE =======================
+# ======================== MAIN APP ========================
 st.title("🧭 Amazon → Micro Center Matcher")
-st.write("Enter an Amazon Best Seller URL below and fetch the Top 20 items for side-by-side comparison.")
+st.write("Fetch Amazon Top-20 items and compare side-by-side with Micro Center SKUs.")
 
 url = st.text_input("Amazon Best Seller Category URL")
 if st.button("Fetch Top 20"):
-    with st.spinner("Fetching Top 20 items from Amazon..."):
+    with st.spinner("Fetching Top 20 items..."):
         items = parse_top20_from_category_page(url)
         session = _session()
         data = []
         for item in items:
-            price, img = fetch_item_details_amzn(item["URL"], session, retries=retries, delay_range=(delay, delay + 1.0))
+            price, img = fetch_item_details_amzn(
+                item["URL"], session, retries=retries, delay_range=(delay, delay + 1.0)
+            )
             data.append({
                 "ASIN": item["ASIN"],
                 "Title": item["Title"],
                 "Price": price,
                 "URL": item["URL"],
-                "Image": img
+                "Image": img,
             })
-        df_amzn = pd.DataFrame(data)
-        st.session_state["df_amzn"] = df_amzn
-        st.success("✅ Fetched successfully!")
+        st.session_state["df_amzn"] = pd.DataFrame(data)
+        st.success("✅ Amazon data fetched successfully!")
 
 if "df_amzn" in st.session_state:
     df = st.session_state["df_amzn"]
     for i, row in df.iterrows():
-        st.markdown(f"**#{i+1}. {row['Title']}**  —  {row['Price']}")
+        st.markdown(f"**#{i+1}. {row['Title']}** — {row['Price']}")
         img_data = load_image_bytes(row["Image"])
         if img_data:
             st.image(img_data, width=150)
@@ -280,9 +271,8 @@ if "df_amzn" in st.session_state:
         st.markdown("---")
 
     if st.button("Export Excel"):
-        df_mc = pd.DataFrame()
-        wb = build_excel(df, df_mc)
-        file_path = f"top20_export_{uuid.uuid4().hex[:6]}.xlsx"
-        wb.save(file_path)
-        with open(file_path, "rb") as f:
-            st.download_button("⬇️ Download Excel", f, file_name=file_path)
+        wb = build_excel(df)
+        filename = f"top20_export_{uuid.uuid4().hex[:6]}.xlsx"
+        wb.save(filename)
+        with open(filename, "rb") as f:
+            st.download_button("⬇️ Download Excel", f, file_name=filename)
