@@ -42,7 +42,7 @@ if theme == "Flannel":
     st.markdown("""
         <style>
         [data-testid="stAppViewContainer"] {
-            background: url("rhythmicRed.png");
+            background: url("https://github.com/aleerMC/amazonScraper/blob/main/rhythmicRed.png");
             background-repeat: repeat;
             background-attachment: fixed;
             background-size: 200px 200px;
