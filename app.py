@@ -91,7 +91,7 @@ def fetch_item_details(url, session=None):
     except Exception:
         return "", ""
 
-def download_and_resize_image(url, max_px=150):
+def download_and_resize_image(url, max_px=140):
     try:
         r = requests.get(url, headers={"User-Agent": random.choice(USER_AGENTS)}, timeout=10)
         r.raise_for_status()
@@ -133,12 +133,14 @@ def build_excel(df):
     left = Alignment(horizontal="left", vertical="center", wrap_text=True)
     font_title = Font(bold=True, size=10)
     font_norm = Font(size=9)
-    fill_even = PatternFill("solid", fgColor="f5f5f5")
-    fill_sep  = PatternFill("solid", fgColor="dcdcdc")
+    font_rank = Font(bold=True, size=11, color="FFFFFF")
+    fill_rank = PatternFill("solid", fgColor="C45500")
+    fill_even = PatternFill("solid", fgColor="F9F9F9")
+    fill_sep  = PatternFill("solid", fgColor="E0E0E0")
 
     items_per_row = 5
-    block_rows = 10
-    img_px = 120
+    block_rows = 11  # 1 image + 10 info lines
+    img_px = 110
 
     for c in range(1, items_per_row+1):
         ws_top.column_dimensions[get_column_letter(c)].width = 26
@@ -148,9 +150,9 @@ def build_excel(df):
         col = 1 + (idx % items_per_row)
         base = 1 + group * block_rows
 
-        # alternating background per block row group
-        fill = fill_even if group%2==0 else None
+        fill = fill_even if group % 2 == 0 else None
 
+        # image row
         img_buf = download_and_resize_image(row.Image, img_px)
         if img_buf:
             xl_img = XLImage(img_buf)
@@ -158,25 +160,31 @@ def build_excel(df):
             ws_top.add_image(xl_img)
         ws_top.row_dimensions[base].height = img_px * 0.75
 
-        def write(line, val, bold=False, align=None):
+        def write(line, val, bold=False, align=None, fill_override=None, font_override=None):
             cell = ws_top.cell(row=base+line, column=col, value=val)
             cell.alignment = align or left
-            cell.font = font_title if bold else font_norm
+            cell.font = font_override or (font_title if bold else font_norm)
             cell.border = border
-            if fill: cell.fill = fill
+            if fill_override:
+                cell.fill = fill_override
+            elif fill:
+                cell.fill = fill
 
-        write(1, f"Rank #{idx+1}", bold=True, align=center)
-        write(2, row.Title)
-        write(3, row.Price, bold=True)
-        write(4, "MC SKU:")
-        write(5, "MC Title:")
-        write(6, "MC Retail:")
-        write(7, "MC Cost:")
-        write(8, "1-4 Avg:")
-        write(9, "Attributes:")
-        write(10, "Notes:")
+        # rank header row
+        write(1, None)  # image occupies row 1
+        write(2, f"Rank #{idx+1}", bold=True, align=center,
+              fill_override=fill_rank, font_override=font_rank)
+        write(3, row.Title)
+        write(4, row.Price, bold=True)
+        write(5, "MC SKU:")
+        write(6, "MC Title:")
+        write(7, "MC Retail:")
+        write(8, "MC Cost:")
+        write(9, "1-4 Avg:")
+        write(10, "Attributes:")
+        write(11, "Notes:")
 
-        # Separation line below each block
+        # separator below each block
         for c2 in range(1, items_per_row+1):
             ws_top.cell(row=base+block_rows, column=c2).fill = fill_sep
 
