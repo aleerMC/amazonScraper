@@ -32,6 +32,53 @@ LABEL_BOLD = True             # bold for label lines
 # ========================= Setup / Helpers =========================
 
 st.set_page_config(page_title="Amazon Top-20 → Micro Center Matcher (Persistent)", layout="wide")
+# === THEME SELECTION ===
+st.sidebar.markdown("### 🧥 Theme Mode")
+theme = st.sidebar.radio("Choose theme:", ["Light", "Dark", "Flannel"], index=1)
+st.session_state["theme"] = theme
+
+# === Apply Theme Styling ===
+if theme == "Flannel":
+    st.markdown("""
+        <style>
+        [data-testid="stAppViewContainer"] {
+            background: url("rhythmicRed.png");
+            background-repeat: repeat;
+            background-attachment: fixed;
+            background-size: 200px 200px;
+        }
+        [data-testid="stHeader"] {
+            background-color: rgba(80, 0, 0, 0.85);
+            background-image: linear-gradient(90deg, rgba(180,0,0,0.6), rgba(120,0,0,0.4));
+        }
+        [data-testid="stSidebar"] {
+            background-color: rgba(50, 0, 0, 0.85);
+        }
+        h1, h2, h3, h4, h5, h6, p, span, div {
+            color: #fefefe !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+elif theme == "Dark":
+    st.markdown("""
+        <style>
+        [data-testid="stAppViewContainer"] {
+            background-color: #0e1117;
+            color: #fafafa;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+else:
+    st.markdown("""
+        <style>
+        [data-testid="stAppViewContainer"] {
+            background-color: #ffffff;
+            color: #000000;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
