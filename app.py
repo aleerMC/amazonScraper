@@ -1,26 +1,24 @@
 import re
 import os
+import json
 import uuid
 import time
 import random
+from io import BytesIO
 from datetime import datetime, timezone
-from urllib.parse import urljoin, quote_plus
+from urllib.parse import urljoin, quote_plus, urlparse
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, PatternFill
+from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.drawing.image import Image as XLImage
+from PIL import Image as PILImage
 
-# ======================== SETUP ========================
-st.set_page_config(
-    page_title="Amazon ⇄ Micro Center Matcher",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-SAVED_DIR = ".saved_searches"
-os.makedirs(SAVED_DIR, exist_ok=True)
+# ---------------- Global Config ----------------
+st.set_page_config(page_title="Amazon → Micro Center Matcher", layout="wide")
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -31,11 +29,17 @@ USER_AGENTS = [
     "(KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
 ]
 
-# ======================== HELPERS ========================
+SAVED_DIR = ".saved_searches"
+os.makedirs(SAVED_DIR, exist_ok=True)
+
+# ---------------- Utility Functions ----------------
 def _session():
     s = requests.Session()
     s.headers.update({"Accept-Language": "en-US,en;q=0.9"})
     return s
+
+def utc_now_str():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 def get_soup(url, session=None, timeout=15):
     session = session or _session()
@@ -44,7 +48,7 @@ def get_soup(url, session=None, timeout=15):
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser"), r.url
 
-# ======================== AMAZON SCRAPER ========================
+# ---------------- Amazon Scraping ----------------
 ASIN_REGEXES = [
     re.compile(r"/dp/([A-Z0-9]{10})(?:[/?]|$)"),
     re.compile(r"/gp/product/([A-Z0-9]{10})(?:[/?]|$)"),
@@ -76,11 +80,6 @@ def parse_top20_from_category_page(url, session=None):
         if not title and a.get("title"):
             title = a["title"].strip()
         item_url = urljoin(final_url, href) if href.startswith("/") else href
-        try:
-            r = session.get(item_url, allow_redirects=True, timeout=10)
-            item_url = r.url
-        except Exception:
-            pass
         seen_asins.add(asin)
         items.append({"ASIN": asin, "Title": title or "", "URL": item_url})
         if len(items) >= 20:
@@ -105,174 +104,202 @@ def extract_image_from_soup_amzn(soup):
                 return img[a]
     return ""
 
-def fetch_item_details_amzn(item_url, session=None, retries=2, delay_range=(1.5, 3.0)):
+def fetch_item_details_amzn(item_url, session=None, retries=2, delay_range=(1.2, 2.4)):
     session = session or _session()
     for attempt in range(retries + 1):
         try:
             soup, _ = get_soup(item_url, session, timeout=20)
             price = extract_price_from_soup_amzn(soup)
             image = extract_image_from_soup_amzn(soup)
-            if image:
-                return price, image
-            time.sleep(random.uniform(*delay_range))
+            return price, image
         except Exception:
             if attempt >= retries:
                 return "", ""
             time.sleep(random.uniform(*delay_range))
     return "", ""
 
-@st.cache_data(ttl=3600)
-def load_image_bytes(url):
+# ---------------- Micro Center Scraping ----------------
+@st.cache_data(ttl=1800)
+def fetch_microcenter_candidates(q: str, limit: int = 8):
+    q = (q or "").strip()
+    if not q:
+        return []
+    session = _session()
+    headers = {"User-Agent": random.choice(USER_AGENTS)}
     try:
-        if not url:
-            return None
-        resp = requests.get(url, headers={"User-Agent": random.choice(USER_AGENTS)}, timeout=10)
-        resp.raise_for_status()
-        return resp.content
-    except Exception:
-        return None
+        search_url = f"https://www.microcenter.com/search/search_results.aspx?Ntt={quote_plus(q)}"
+        r = session.get(search_url, headers=headers, timeout=20)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
 
-# ======================== MICRO CENTER SCRAPER ========================
-def fetch_microcenter_info(sku):
-    base_url = f"https://www.microcenter.com/search/search_results.aspx?Ntt={quote_plus(str(sku))}"
-    try:
-        soup, _ = get_soup(base_url)
-        links = soup.select("a.ProductLink") or soup.select("a[href*='/product/']")
-        for link in links:
-            href = link.get("href", "")
-            if "battery" in href.lower():
+        links = []
+        for a in soup.select("a[href*='/product/']"):
+            href = a["href"]
+            if any(x in href.lower() for x in ["service", "battery", "repair"]):
                 continue
-            full_url = urljoin(base_url, href)
-            psoup, _ = get_soup(full_url)
+            links.append("https://www.microcenter.com" + href)
+        links = list(dict.fromkeys(links))
+        results = []
+        for l in links[:limit]:
+            psoup, _ = get_soup(l, session)
+            sku = ""
+            sku_meta = psoup.find(attrs={"itemprop": "sku"})
+            if sku_meta:
+                sku = sku_meta.get("content") or sku_meta.get_text(strip=True)
             title = psoup.find("h1")
-            price_el = psoup.find("span", {"itemprop": "price"})
-            img_el = psoup.find("img", {"id": "productImage"})
-            desc = psoup.find("div", {"class": "specs"})
-            return {
-                "Title": title.get_text(strip=True) if title else "",
-                "Price": price_el.get_text(strip=True) if price_el else "",
-                "Image": img_el["src"] if img_el else "",
-                "Description": desc.get_text(strip=True) if desc else "",
-                "URL": full_url,
-            }
+            price = psoup.find(attrs={"itemprop": "price"})
+            img = psoup.find("meta", {"property": "og:image"})
+            results.append({
+                "MCSKU": sku,
+                "MCTitle": title.get_text(strip=True) if title else "",
+                "MCPrice": price.get("content") if price and price.get("content") else "",
+                "MCImageURL": img["content"] if img and img.get("content") else "",
+                "MCURL": l
+            })
+        return results
     except Exception:
-        return {}
-    return {}
+        return []
 
-# ======================== EXCEL EXPORT ========================
-def build_excel(df_amzn):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Top 20"
-    ws.append([
-        "Amazon Image", "Amazon Title", "Amazon Price", "Amazon Link",
-        "MC Image", "MC SKU", "MC Description", "MC Price",
-        "Attributes", "Notes"
-    ])
-    ws.freeze_panes = "A2"
-    for i, row in enumerate(df_amzn.itertuples(), start=2):
-        band = "FFFFFF" if i % 2 else "F7F7F7"
-        ws.append(["", row.Title, row.Price, row.URL, "", "", "", "", "", ""])
-        for j in range(1, 11):
-            ws.cell(i, j).fill = PatternFill("solid", fgColor=band)
-            ws.cell(i, j).alignment = Alignment(wrap_text=True, vertical="top")
-    for col in range(1, 11):
-        ws.column_dimensions[get_column_letter(col)].width = 25
-    return wb
+# ---------------- Persistence ----------------
+def _run_path(run_id): return os.path.join(SAVED_DIR, run_id)
+def _meta_path(run_id): return os.path.join(_run_path(run_id), "meta.json")
+def _data_path(run_id): return os.path.join(_run_path(run_id), "data.csv")
 
-# ======================== SIDEBAR SETTINGS ========================
-with st.sidebar.expander("⚙️ Settings", expanded=False):
-    st.markdown("### Display & Speed Settings")
-    theme = st.radio("Theme", ["Light", "Dark", "Flannel"], horizontal=True)
-    delay = st.slider("Scrape Delay (sec)", 0.5, 5.0, 1.5, 0.5)
-    retries = st.slider("Retry Count", 0, 4, 2, 1)
+def list_saved_runs():
+    runs = []
+    for rid in os.listdir(SAVED_DIR):
+        mp = _meta_path(rid)
+        dp = _data_path(rid)
+        if os.path.exists(mp) and os.path.exists(dp):
+            try:
+                with open(mp, "r", encoding="utf-8") as f: meta = json.load(f)
+                runs.append({"id": rid, **meta})
+            except Exception: pass
+    runs.sort(key=lambda r: r.get("updated_at", ""), reverse=True)
+    return runs
 
-# ======================== THEME CSS ========================
-if theme == "Flannel":
-    st.markdown(
-        """
-        <style>
-        .stApp {
-            background-color: #1e1e1e;
-            position: relative;
-            overflow: hidden;
-        }
-        /* translucent plaid overlay */
-        .stApp::before {
-            content: "";
-            position: absolute;
-            top: 0; left: 0;
-            width: 100%; height: 100%;
-            background-image: url('rhythmicRed.png');
-            background-size: 400px auto;
-            background-repeat: repeat;
-            opacity: 0.25;
-            z-index: -1;
-        }
-        section[data-testid="stSidebar"] > div:first-child {
-            background: linear-gradient(180deg,#2c0000 0%,#1e1e1e 100%);
-            border-right: 1px solid #440000;
-        }
-        h1,h2,h3,h4,h5,h6 { color: #ffdddd !important; }
-        .stButton button {
-            background: #660000; color:white;
-            border:1px solid #992222; border-radius:8px;
-        }
-        .stButton button:hover { background:#992222; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-elif theme == "Dark":
+def save_run(run_id, df, meta):
+    os.makedirs(_run_path(run_id), exist_ok=True)
+    df.to_csv(_data_path(run_id), index=False, encoding="utf-8")
+    meta["updated_at"] = utc_now_str()
+    with open(_meta_path(run_id), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+def load_run(run_id):
+    df = pd.read_csv(_data_path(run_id), dtype=str).fillna("")
+    with open(_meta_path(run_id), "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    return df, meta
+
+# ---------------- Sidebar ----------------
+with st.sidebar:
+    st.header("Saved Searches")
+
+    saved = list_saved_runs()
+    if saved:
+        st.markdown("---")
+        for s in saved:
+            st.markdown(f"**{s['name']}**  \n🕓 *{s.get('updated_at','')}*  \n🔗 *{s.get('category_desc','')}*")
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                if st.button("Load", key=f"load_{s['id']}"):
+                    df, meta = load_run(s["id"])
+                    st.session_state.results = df
+                    st.session_state.current_run_id = s["id"]
+                    st.session_state.current_meta = meta
+                    st.rerun()
+            with col2:
+                if st.button("Save", key=f"save_{s['id']}"):
+                    if st.session_state.results is not None:
+                        save_run(s["id"], st.session_state.results, st.session_state.current_meta)
+                        st.success("Saved.")
+            with col3:
+                if st.button("Rename", key=f"rename_{s['id']}"):
+                    new_name = st.text_input("New Name", s["name"], key=f"name_{s['id']}")
+                    if new_name.strip():
+                        df, meta = load_run(s["id"])
+                        meta["name"] = new_name.strip()
+                        save_run(s["id"], df, meta)
+                        st.success("Renamed.")
+            with col4:
+                if st.button("Delete", key=f"delete_{s['id']}"):
+                    import shutil
+                    shutil.rmtree(_run_path(s["id"]), ignore_errors=True)
+                    st.warning(f"Deleted {s['name']}")
+                    st.rerun()
+            st.markdown("---")
+    else:
+        st.caption("No saved searches yet.")
+
+    with st.expander("⚙️ Settings", expanded=False):
+        theme = st.radio("Theme", ["Light", "Dark"], horizontal=True)
+        delay = st.slider("Scrape Delay (sec)", 0.5, 5.0, 1.5, 0.5)
+
+# ---------------- Theme Styling ----------------
+if theme == "Dark":
     st.markdown("<style>body{background-color:#0E1117;color:#FAFAFA;}</style>", unsafe_allow_html=True)
 else:
-    st.markdown("<style>body{background-color:white;color:black;}</style>", unsafe_allow_html=True)
+    st.markdown("<style>body{background-color:#FFFFFF;color:#000000;}</style>", unsafe_allow_html=True)
 
-# ======================== MAIN APP ========================
+# ---------------- Main App UI ----------------
 st.title("🧭 Amazon → Micro Center Matcher")
-st.write("Fetch Amazon Top-20 items and compare side-by-side with Micro Center SKUs.")
 
-url = st.text_input("Amazon Best Seller Category URL")
-if st.button("Fetch Top 20"):
-    with st.spinner("Fetching Top 20 items..."):
-        items = parse_top20_from_category_page(url)
-        session = _session()
-        data = []
-        for item in items:
-            price, img = fetch_item_details_amzn(
-                item["URL"], session, retries=retries, delay_range=(delay, delay + 1.0)
-            )
-            data.append({
-                "ASIN": item["ASIN"],
-                "Title": item["Title"],
-                "Price": price,
-                "URL": item["URL"],
-                "Image": img,
-            })
-        st.session_state["df_amzn"] = pd.DataFrame(data)
-        st.success("✅ Amazon data fetched successfully!")
+col_in1, col_in2 = st.columns([3,2])
+with col_in1:
+    amz_url = st.text_input("Amazon Best Sellers URL", placeholder="https://www.amazon.com/gp/bestsellers/pc/...")
+with col_in2:
+    category_desc = st.text_input("Category Description", placeholder="e.g., Single Board Computers")
 
-if "df_amzn" in st.session_state:
-    df = st.session_state["df_amzn"]
-    for i, row in df.iterrows():
-        st.markdown(f"**#{i+1}. {row['Title']}** — {row['Price']}")
-        img_data = load_image_bytes(row["Image"])
-        if img_data:
-            st.image(img_data, width=150)
-        mc_sku = st.text_input(f"Micro Center SKU for {row['ASIN']}", key=f"sku_{i}")
-        if mc_sku:
-            info = fetch_microcenter_info(mc_sku)
-            if info:
-                st.image(load_image_bytes(info["Image"]), width=120)
-                st.write(f"**{info['Title']}** — {info['Price']}")
-                st.write(info["Description"])
-        st.text_area("Attributes", key=f"attr_{i}")
-        st.text_area("Notes", key=f"note_{i}")
+if st.button("Fetch Top 20", type="primary"):
+    session = _session()
+    st.info("Fetching top 20 items from Amazon...")
+    items = parse_top20_from_category_page(amz_url.strip(), session)
+    rows = []
+    for i, item in enumerate(items):
+        p, img = fetch_item_details_amzn(item["URL"], session)
+        rows.append({
+            "Rank": i+1, "ASIN": item["ASIN"], "Title": item["Title"], "URL": item["URL"],
+            "Price": p, "Image": img, "Notes": "", "AttrMatch": "", "Category": category_desc
+        })
+        time.sleep(delay)
+    st.session_state.results = pd.DataFrame(rows)
+    st.session_state.current_meta = {"name": category_desc, "updated_at": utc_now_str()}
+    st.success("Top 20 fetched!")
+
+# ---------------- Display ----------------
+if "results" in st.session_state and st.session_state.results is not None:
+    df = st.session_state.results
+    for i, r in df.iterrows():
+        c1, c2, c3 = st.columns([1,1,1])
+        with c1:
+            st.image(r["Image"], width=120)
+            st.markdown(f"**#{r['Rank']} — {r['Title']}**  \n{r['Price']}")
+        with c2:
+            sku = st.text_input("MC SKU", key=f"sku_{i}")
+            if sku:
+                mc = fetch_microcenter_candidates(sku, 3)
+                if mc:
+                    st.image(mc[0]["MCImageURL"], width=100)
+                    st.write(mc[0]["MCTitle"])
+                    st.write(f"Price: {mc[0]['MCPrice']}")
+        with c3:
+            df.at[i, "AttrMatch"] = st.text_input("Attributes", value=r["AttrMatch"], key=f"attr_{i}")
+            df.at[i, "Notes"] = st.text_input("Notes", value=r["Notes"], key=f"note_{i}")
         st.markdown("---")
 
+    if st.button("Save Search"):
+        run_id = uuid.uuid4().hex[:12]
+        save_run(run_id, df, {"name": category_desc, "updated_at": utc_now_str()})
+        st.success("Saved!")
+
     if st.button("Export Excel"):
-        wb = build_excel(df)
-        filename = f"top20_export_{uuid.uuid4().hex[:6]}.xlsx"
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Top 20"
+        ws.append(df.columns.tolist())
+        for _, row in df.iterrows():
+            ws.append(row.tolist())
+        filename = f"Top20_{uuid.uuid4().hex[:6]}.xlsx"
         wb.save(filename)
         with open(filename, "rb") as f:
-            st.download_button("⬇️ Download Excel", f, file_name=filename)
+            st.download_button("⬇️ Download", f, file_name=filename)
