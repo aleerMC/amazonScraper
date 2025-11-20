@@ -45,19 +45,34 @@ CARD_CSS = """
 .card{
   background:#ffffff;
   color:#000000;
-  border:1px solid #e6e6e6;
-  border-radius:10px;
-  padding:10px;
-  margin:4px;
-  box-shadow:0 1px 3px rgba(0,0,0,0.06);
+  border:1px solid #e0e0e0;
+  border-radius:8px;
+  padding:8px;
+  margin:3px;
+  box-shadow:0 1px 3px rgba(0,0,0,0.05);
+  font-size:0.85rem;
 }
-.card:hover{ box-shadow:0 2px 8px rgba(0,0,0,0.12); }
-.title{ font-weight:600; font-size:0.95rem; line-height:1.25rem; margin:4px 0; }
+.card:hover{ box-shadow:0 2px 6px rgba(0,0,0,0.12); }
+.title{
+  font-weight:600;
+  font-size:0.90rem;
+  line-height:1.2rem;
+  margin:4px 0 2px 0;
+}
 .price{ color:#B12704; font-weight:700; margin:2px 0; }
-.sell{ font-size:0.82rem; color:#444; margin:2px 0; }
-.rankbar{ background:#C45500; color:#fff; padding:2px 8px; border-radius:6px; display:inline-block; font-weight:800; }
-.meta a{ text-decoration:none; font-size:0.85rem; }
-.toolbar .stButton>button { height:40px; }
+.sell{ font-size:0.78rem; color:#444; margin:2px 0; }
+.rankbar{
+  background:#C45500;
+  color:#fff;
+  padding:1px 6px;
+  border-radius:6px;
+  display:inline-block;
+  font-weight:800;
+  font-size:0.78rem;
+  margin-bottom:4px;
+}
+.meta a{ text-decoration:none; font-size:0.80rem; }
+.toolbar .stButton>button { height:40px; padding:0 10px; }
 </style>
 """
 
@@ -165,7 +180,7 @@ def list_saved():
             if os.path.exists(mp) and os.path.exists(dp):
                 meta = json.load(open(mp, "r"))
                 runs.append({"id": rid, **meta})
-        except:
+        except Exception:
             pass
     runs.sort(key=lambda r: r.get("updated",""), reverse=True)
     return runs
@@ -216,27 +231,49 @@ if col_sb2.button("Delete"):
         st.warning("Deleted. Refreshing list…")
         st.rerun()
 
-st.sidebar.caption("Only a dropdown + Load/Delete to keep this area clean.")
+st.sidebar.caption("Dropdown + Load/Delete only, to keep things clean.")
 
 # ========================= Top Toolbar =========================
 st.markdown(CARD_CSS, unsafe_allow_html=True)
 toolbar = st.container()
 with toolbar:
-    c1, c2, c3, c4 = st.columns([1.2, 1.4, 1.6, 2.8])
+    c1, c2, c3, c4 = st.columns([1.2, 1.4, 1.7, 2.7])
 
     fetch_clicked = c1.button("Fetch Top 20", type="primary")
     download_placeholder = c2.empty()
 
-    view_mode = c3.radio("View Mode", ["List", "Grid", "Compact"], horizontal=True, label_visibility="visible")
+    view_mode = c3.radio(
+        "View Mode",
+        ["List", "Grid", "Compact"],
+        horizontal=True,
+        label_visibility="visible"
+    )
 
     with c4.expander("⚙️ Settings", expanded=False):
-        st.session_state.delay_min = st.slider("Min per-item delay (sec)", 0.3, 5.0, st.session_state.delay_min, 0.1, key="delay_min_slider")
-        st.session_state.delay_max = st.slider("Max per-item delay (sec)", 0.4, 6.0, st.session_state.delay_max, 0.1, key="delay_max_slider")
-        st.session_state.debug = st.checkbox("Debug (log basic events)", value=st.session_state.debug)
+        st.session_state.delay_min = st.slider(
+            "Min per-item delay (sec)", 0.3, 5.0,
+            st.session_state.delay_min, 0.1,
+            key="delay_min_slider"
+        )
+        st.session_state.delay_max = st.slider(
+            "Max per-item delay (sec)", 0.4, 6.0,
+            st.session_state.delay_max, 0.1,
+            key="delay_max_slider"
+        )
+        st.session_state.debug = st.checkbox(
+            "Debug (log basic events)",
+            value=st.session_state.debug
+        )
 
 # ========================= Inputs (below toolbar) =========================
-url = st.text_input("Amazon Best Sellers URL", placeholder="https://www.amazon.com/gp/bestsellers/pc/17441247011")
-name = st.text_input("Category Name (for saving/export)", placeholder="e.g., Single Board Computers")
+url = st.text_input(
+    "Amazon Best Sellers URL",
+    placeholder="https://www.amazon.com/gp/bestsellers/pc/17441247011"
+)
+name = st.text_input(
+    "Category Name (for saving/export)",
+    placeholder="e.g., Single Board Computers"
+)
 
 # ========================= Fetch Handler =========================
 if fetch_clicked:
@@ -256,7 +293,11 @@ if fetch_clicked:
 
         for i, it in enumerate(items, start=1):
             status.write(f"Fetching item {i} of {len(items)}…")
-            price, image, sell = fetch_details(it["URL"], s, delay=(st.session_state.delay_min, st.session_state.delay_max))
+            price, image, sell = fetch_details(
+                it["URL"],
+                s,
+                delay=(st.session_state.delay_min, st.session_state.delay_max)
+            )
             out.append({
                 "Rank": i,
                 "Title": it["Title"],
@@ -265,7 +306,7 @@ if fetch_clicked:
                 "Price": price,
                 "Image": image,
                 "Sell": sell,
-                # Pre-allocated Micro Center manual fields for Data sheet
+                # Fields for Data sheet (MC comparison later)
                 "MCSKU": "", "MCTitle": "", "MCRetail": "",
                 "MCCost": "", "Avg1_4": "", "Attributes": "", "Notes": "",
             })
@@ -273,29 +314,50 @@ if fetch_clicked:
                 progress.progress(int(i / max(1, len(items)) * 100))
             time.sleep(random.uniform(st.session_state.delay_min, st.session_state.delay_max))
 
-        if progress: progress.empty()
+        if progress:
+            progress.empty()
         status.success("Top 20 fetched!")
         st.session_state.df = pd.DataFrame(out)
         st.session_state.meta = new_meta(name or "Top 20", url.strip())
 
-# ========================= Display Results =========================
+# ========================= Display Results (no re-scrape on view change) =========================
 def render_list(df: pd.DataFrame):
     for _, r in df.iterrows():
-        st.markdown(f"### #{r['Rank']} — {r['Title']}")
-        cols = st.columns([1, 3])
-        with cols[0]:
+        row = st.container()
+        with row:
+            cols = st.columns([1, 4])
+            img_html = ""
             if isinstance(r["Image"], str) and r["Image"]:
-                try:
-                    st.image(r["Image"], width=120)
-                except Exception:
+                img_html = f"<img src='{r['Image']}' width='90'/>"
+            with cols[0]:
+                if img_html:
+                    st.markdown(img_html, unsafe_allow_html=True)
+                else:
                     st.write("—")
-        with cols[1]:
-            if r["Price"]:
-                st.write(r["Price"])
-            if r["Sell"]:
-                st.caption(r["Sell"])
-            st.write(f"[Open on Amazon]({r['URL']})")
-        st.divider()
+            with cols[1]:
+                st.markdown(
+                    f"<span class='rankbar'>#{r['Rank']}</span>",
+                    unsafe_allow_html=True
+                )
+                st.markdown(
+                    f"<div class='title'>{r['Title']}</div>",
+                    unsafe_allow_html=True
+                )
+                if r["Price"]:
+                    st.markdown(
+                        f"<div class='price'>{r['Price']}</div>",
+                        unsafe_allow_html=True
+                    )
+                if r["Sell"]:
+                    st.markdown(
+                        f"<div class='sell'>{r['Sell']}</div>",
+                        unsafe_allow_html=True
+                    )
+                st.markdown(
+                    f"<a href='{r['URL']}' target='_blank'>Open on Amazon</a>",
+                    unsafe_allow_html=True
+                )
+        st.markdown("<hr/>", unsafe_allow_html=True)
 
 def render_cards(df: pd.DataFrame, imgw: int):
     ncols = 5
@@ -304,9 +366,9 @@ def render_cards(df: pd.DataFrame, imgw: int):
         cols = st.columns(ncols)
         for c, (_, r) in zip(cols, row.iterrows()):
             html = "<div class='card'>"
-            html += f"<div class='rankbar'>#{r['Rank']}</div><br>"
+            html += f"<div class='rankbar'>#{r['Rank']}</div>"
             if isinstance(r["Image"], str) and r["Image"]:
-                html += f"<img src='{r['Image']}' width='{imgw}'/><br>"
+                html += f"<br><img src='{r['Image']}' width='{imgw}'/>"
             html += f"<div class='title'>{r['Title']}</div>"
             if r["Price"]:
                 html += f"<div class='price'>{r['Price']}</div>"
@@ -319,11 +381,14 @@ def render_cards(df: pd.DataFrame, imgw: int):
 
 if st.session_state.df is not None:
     df = st.session_state.df.copy()
+    # ensure we never show more than 20
+    df = df.head(20)
+
     if view_mode == "List":
         render_list(df)
     elif view_mode == "Grid":
-        render_cards(df, imgw=120)
-    else:
+        render_cards(df, imgw=110)
+    else:  # Compact
         render_cards(df, imgw=80)
 
 # ========================= Excel Export =========================
@@ -382,12 +447,13 @@ def build_xlsx(df: pd.DataFrame) -> bytes:
     wrap_top = Alignment(wrap_text=True, vertical="top")
     center_mid = Alignment(horizontal="center", vertical="center")
     ITEMS_PER_ROW = 5
-    ROW_BLOCK = 11  # rank + image + 8 info rows
+    ROW_BLOCK = 11  # rank + image + 9 info rows
 
     def data_ref(col_idx, drow):
         return f"Data!{get_column_letter(col_idx)}{drow}"
 
-    for idx in range(min(20, len(df))):
+    max_items = min(20, len(df))
+    for idx in range(max_items):
         group = idx // ITEMS_PER_ROW
         col = (idx % ITEMS_PER_ROW) + 1
         base = group * ROW_BLOCK + 1
@@ -407,7 +473,6 @@ def build_xlsx(df: pd.DataFrame) -> bytes:
             xl = XLImage(img_buf)
             xl.anchor = f"{get_column_letter(col)}{base + 1}"
             ws_top.add_image(xl)
-        # ensure a cell is present for borders
         img_cell = ws_top.cell(row=base + 1, column=col, value=" ")
         img_cell.border = BORDER_BOX
 
@@ -425,8 +490,11 @@ def build_xlsx(df: pd.DataFrame) -> bytes:
             ("Notes",     14),
         ]
         for r_off, (label, dcol) in enumerate(info, start=2):
-            cell = ws_top.cell(row=base + r_off, column=col,
-                               value=f'=CONCAT("{label}: ", {data_ref(dcol, drow)})')
+            cell = ws_top.cell(
+                row=base + r_off,
+                column=col,
+                value=f'=CONCAT("{label}: ", {data_ref(dcol, drow)})'
+            )
             cell.alignment = wrap_top
             cell.border = BORDER_BOX
 
@@ -440,7 +508,7 @@ if st.session_state.df is not None:
     with toolbar:
         download_placeholder.download_button(
             "Download Excel",
-            data=build_xlsx(st.session_state.df),
+            data=build_xlsx(st.session_state.df.head(20)),
             file_name=f"{(st.session_state.meta or {'name':'Top_20'})['name'].replace(' ','_')}_Top20.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
