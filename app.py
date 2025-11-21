@@ -1,528 +1,779 @@
 import os
 import re
 import json
-import time
 import uuid
+import time
 import random
 from io import BytesIO
 from datetime import datetime, timezone
-from urllib.parse import urljoin
-from typing import Optional
+from urllib.parse import urljoin, urlparse
+from typing import Optional, List, Dict
 
-import requests
 import pandas as pd
+import requests
 from bs4 import BeautifulSoup
 import streamlit as st
 
-from PIL import Image as PILImage
 from openpyxl import Workbook
-from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.drawing.image import Image as XLImage
+from PIL import Image as PILImage
 
-# ========================= App Setup =========================
-st.set_page_config(page_title="Amazon Top-20 → Excel Exporter", layout="wide")
+# ---------------- Excel layout knobs ----------------
+EXCEL_COL_WIDTH = 24          # width per item column
+EXCEL_IMG_MAX_PX = 220        # max embedded image size (longest side)
+EXCEL_IMG_ROW_HEIGHT = 90     # image row height
+ITEMS_PER_ROW = 5             # 5 items per "band"
+BLOCK_ROWS = 12               # rows per item block (1 image + 11 text lines)
+BAND_COLOR_1 = "FFFFFF"       # white
+BAND_COLOR_2 = "F7F7F7"       # light gray
+RANK_BGCOLOR = "C45500"       # Amazon-style orange for Rank row
+RANK_FGCOLOR = "FFFFFF"       # White text for Rank row
+
+# ====================================================
+# Basic setup
+# ====================================================
+
+st.set_page_config(
+    page_title="Amazon Top-20 Scraper",
+    layout="wide",
+)
 
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
 ]
 
 SAVED_DIR = ".saved_searches"
 os.makedirs(SAVED_DIR, exist_ok=True)
 
-# Excel layout knobs
-EXCEL_COL_WIDTH = 24
-EXCEL_IMG_MAX_PX = 200
-EXCEL_IMG_ROW_HEIGHT = 82
-RANK_FILL = PatternFill("solid", fgColor="C45500")
-WHITE_FONT = Font(color="FFFFFF", bold=True)
-THIN_SIDE = Side(style="thin", color="DDDDDD")
-BORDER_BOX = Border(left=THIN_SIDE, right=THIN_SIDE, top=THIN_SIDE, bottom=THIN_SIDE)
 
-CARD_CSS = """
-<style>
-.card{
-  background:#ffffff;
-  color:#000000;
-  border:1px solid #e6e6e6;
-  border-radius:10px;
-  padding:10px;
-  margin:4px;
-  box-shadow:0 1px 3px rgba(0,0,0,0.06);
-}
-.card:hover{ box-shadow:0 2px 8px rgba(0,0,0,0.12); }
-.title{ font-weight:600; font-size:0.95rem; line-height:1.25rem; margin:4px 0; }
-.price{ color:#B12704; font-weight:700; margin:2px 0; }
-.sell{ font-size:0.82rem; color:#444; margin:2px 0; }
-.rankbar{ background:#C45500; color:#fff; padding:2px 8px; border-radius:6px; display:inline-block; font-weight:800; }
-.meta a{ text-decoration:none; font-size:0.85rem; }
-.toolbar .stButton>button { height:40px; }
-</style>
-"""
-
-# ========================= Helpers =========================
-def _session():
+def _session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"Accept-Language": "en-US,en;q=0.9"})
     return s
 
-def utc_now():
+
+def utc_now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-def get_soup(url, s=None, timeout=15):
-    s = s or _session()
-    r = s.get(url, headers={"User-Agent": random.choice(USER_AGENTS)}, timeout=timeout)
+
+# ====================================================
+# Amazon scraping
+# ====================================================
+
+def get_soup(url: str, session: Optional[requests.Session] = None, timeout: int = 15):
+    """
+    Fetch URL and return (BeautifulSoup, final_url).
+    """
+    if not url.lower().startswith("http"):
+        raise ValueError("URL must start with http:// or https://")
+    session = session or _session()
+    headers = {"User-Agent": random.choice(USER_AGENTS)}
+    r = session.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
-    return BeautifulSoup(r.text, "html.parser")
+    return BeautifulSoup(r.text, "html.parser"), r.url
 
-# ========================= Amazon scraping =========================
-def extract_asin(url: str):
-    patterns = [
-        r"/dp/([A-Z0-9]{10})(?:[/?]|$)",
-        r"/gp/product/([A-Z0-9]{10})(?:[/?]|$)",
-        r"[?&]ASIN=([A-Z0-9]{10})(?:&|$)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, url, re.I)
-        if m:
-            return m.group(1)
-    return None
 
-def parse_top20(url: str, s=None):
-    s = s or _session()
-    soup = get_soup(url, s)
-    items, seen = [], set()
+ASIN_REGEX = re.compile(r"/dp/([A-Z0-9]{10})")
+
+
+def _extract_from_faceouts(soup: BeautifulSoup) -> List[Dict]:
+    """
+    Preferred parser for Best Sellers pages:
+    - Uses <div class="p13n-sc-uncoverable-faceout" id="<ASIN>"> blocks
+    - Extracts ASIN, title, URL, image URL, price, and (if present) sell-through text.
+    """
+    base = "https://www.amazon.com"
+    items = []
+
+    faceouts = soup.find_all("div", class_="p13n-sc-uncoverable-faceout")
+    for div in faceouts:
+        asin = div.get("id") or ""
+        if not asin or len(asin) != 10:
+            # fallback from href
+            for a in div.find_all("a", href=True):
+                m = ASIN_REGEX.search(a["href"])
+                if m:
+                    asin = m.group(1)
+                    break
+
+        # Title + URL
+        title = ""
+        url = ""
+        # Prefer anchors with non-price text
+        for a in div.find_all("a", href=True):
+            text = a.get_text(" ", strip=True)
+            if text and "$" not in text:
+                url = a["href"]
+                title = text
+                break
+        if not url:
+            # fallback: first anchor
+            a = div.find("a", href=True)
+            if a:
+                url = a["href"]
+                title = a.get_text(" ", strip=True)
+
+        if url and url.startswith("/"):
+            url = base + url
+
+        # Image
+        img_url = ""
+        img = div.find("img")
+        if img:
+            img_url = img.get("src") or ""
+
+        # Sell-through text (e.g. "9K+ bought in past month")
+        sell = ""
+        for span in div.find_all("span"):
+            t = span.get_text(" ", strip=True)
+            if "bought" in t.lower():
+                sell = t
+                break
+
+        # Price: pick shortest text containing a $ and extract the $XX.XX
+        price_candidates = []
+        for el in div.find_all(["span", "a", "div"], recursive=True):
+            t = el.get_text(" ", strip=True)
+            if "$" in t:
+                m = re.search(r"\$\s*\d[\d,]*(?:\.\d{2})?", t)
+                if m:
+                    price_candidates.append(m.group(0).replace(" ", ""))
+        price = ""
+        if price_candidates:
+            price = min(price_candidates, key=len)
+
+        items.append(
+            {
+                "ASIN": asin,
+                "Title": title,
+                "URL": url,
+                "ImageURL": img_url,
+                "AmazonPrice": price,
+                "AmazonSellThru": sell,
+            }
+        )
+        if len(items) >= 20:
+            break
+
+    return items
+
+
+def _extract_from_links(soup: BeautifulSoup, base_url: str) -> List[Dict]:
+    """
+    Fallback parser: scan all anchors for unique ASINs.
+    Used if faceout-based parsing fails for some reason.
+    """
+    items = []
+    seen = set()
+    base = base_url
+
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        asin = extract_asin(href or "")
-        if not asin or asin in seen:
+        m = ASIN_REGEX.search(href)
+        if not m:
             continue
+        asin = m.group(1)
+        if asin in seen:
+            continue
+
         title = (a.get_text(strip=True) or "").strip()
         if not title:
             img = a.find("img", alt=True)
             if img and img.get("alt"):
                 title = img["alt"].strip()
-        if not title and a.get("title"):
-            title = a["title"].strip()
-        items.append({
-            "ASIN": asin,
-            "Title": title,
-            "URL": urljoin(url, href),
-        })
+
+        url = urljoin(base, href) if href.startswith("/") else href
+        items.append(
+            {
+                "ASIN": asin,
+                "Title": title,
+                "URL": url,
+                "ImageURL": "",
+                "AmazonPrice": "",
+                "AmazonSellThru": "",
+            }
+        )
         seen.add(asin)
         if len(items) >= 20:
             break
-    return items[:20]
 
-def extract_price(soup: BeautifulSoup) -> str:
-    # Primary: span.a-offscreen with $
-    for sp in soup.select("span.a-offscreen"):
-        t = sp.get_text(strip=True)
-        if t.startswith("$"):
-            return t
-    # Backup: meta price
-    meta = soup.find("meta", attrs={"itemprop": "price"})
-    if meta and meta.get("content"):
-        c = meta["content"]
-        return c if c.startswith("$") else f"${c}"
-    return ""
+    return items
 
-def extract_sellthrough(soup: BeautifulSoup) -> str:
-    # Look for "X bought in past month"
-    pat = re.compile(r"\b\d[\d,\.K\+]*\s*\+?\s*bought.*past\s+month", re.I)
-    for el in soup.find_all(["div", "span"], string=pat):
-        txt = el.get_text(" ", strip=True)
-        if txt:
-            return txt
-    pat2 = re.compile(r"bought.*past\s+month", re.I)
-    for el in soup.find_all(["div", "span"], string=pat2):
-        txt = el.get_text(" ", strip=True)
-        if re.search(r"\d", txt):
-            return txt
-    return ""
 
-def extract_image(soup: BeautifulSoup) -> str:
-    # og:image
-    og = soup.find("meta", {"property": "og:image"})
-    if og and og.get("content"):
-        return og["content"]
-    # link rel=image_src
-    for link in soup.find_all("link", rel=True):
-        rel = " ".join(link.get("rel", [])).lower()
-        if "image_src" in rel and link.get("href"):
-            return link["href"]
-    # landing image
-    landing = soup.find("img", id="landingImage")
-    if landing:
-        for attr in ("data-old-hires", "src", "data-a-dynamic-image"):
-            val = landing.get(attr)
-            if not val:
-                continue
-            if attr == "data-a-dynamic-image" and isinstance(val, str):
-                m = re.search(r'"(https:[^"]+)"\s*:', val)
-                if m:
-                    return m.group(1)
-            elif isinstance(val, str):
-                return val
-    # wrapper image
-    img = soup.select_one("#imgTagWrapperId img")
-    if img:
-        for attr in ("data-old-hires", "src"):
-            if img.get(attr):
-                return img.get(attr)
-    return ""
+def parse_top20_from_category_page(url: str, session: Optional[requests.Session] = None) -> List[Dict]:
+    """
+    High-level parser: try faceout blocks first; if we get nothing, fall back to link scan.
+    """
+    session = session or _session()
+    soup, final_url = get_soup(url, session)
+    items = _extract_from_faceouts(soup)
+    if not items:
+        items = _extract_from_links(soup, final_url)
+    return items
 
-def fetch_details(url: str, s=None, retries: int = 2, delay=(1.0, 2.0)):
-    s = s or _session()
-    for attempt in range(retries + 1):
-        try:
-            soup = get_soup(url, s, timeout=20)
-            price = extract_price(soup)
-            img = extract_image(soup)
-            sell = extract_sellthrough(soup)
-            return price, img, sell
-        except Exception:
-            if attempt >= retries:
-                return "", "", ""
-            time.sleep(random.uniform(*delay))
-    return "", "", ""
 
-# ========================= Image fetch for UI & Excel =========================
-def _download_image_bytes(url: str, max_px: int = EXCEL_IMG_MAX_PX) -> Optional[BytesIO]:
-    try:
-        if not url or not isinstance(url, str):
-            return None
-        if not url.lower().startswith("http"):
-            return None
-        resp = requests.get(url, headers={"User-Agent": random.choice(USER_AGENTS)}, timeout=15)
-        resp.raise_for_status()
-        img = PILImage.open(BytesIO(resp.content)).convert("RGBA")
-        img.thumbnail((max_px, max_px), PILImage.LANCZOS)
-        buff = BytesIO()
-        img.save(buff, format="PNG")
-        buff.seek(0)
-        return buff
-    except Exception:
-        return None
+# ====================================================
+# Persistence (simple CSV + JSON, no pyarrow)
+# ====================================================
 
-# ========================= Persistence =========================
-def _run_path(run_id): return os.path.join(SAVED_DIR, run_id)
-def _meta_path(run_id): return os.path.join(_run_path(run_id), "meta.json")
-def _data_path(run_id): return os.path.join(_run_path(run_id), "data.csv")
+def _run_path(run_id: str) -> str:
+    return os.path.join(SAVED_DIR, run_id)
 
-def list_saved():
+
+def _meta_path(run_id: str) -> str:
+    return os.path.join(_run_path(run_id), "meta.json")
+
+
+def _data_path(run_id: str) -> str:
+    return os.path.join(_run_path(run_id), "data.csv")
+
+
+def list_saved_runs() -> List[Dict]:
     runs = []
     for rid in os.listdir(SAVED_DIR):
-        mp, dp = _meta_path(rid), _data_path(rid)
-        if os.path.exists(mp) and os.path.exists(dp):
+        rp = _run_path(rid)
+        mp = _meta_path(rid)
+        dp = _data_path(rid)
+        if os.path.isdir(rp) and os.path.exists(mp) and os.path.exists(dp):
             try:
-                meta = json.load(open(mp, "r"))
+                with open(mp, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
                 runs.append({"id": rid, **meta})
             except Exception:
                 continue
-    runs.sort(key=lambda r: r.get("updated", ""), reverse=True)
+    runs.sort(key=lambda r: r.get("updated_at", ""), reverse=True)
     return runs
 
-def save_run(run_id, df: pd.DataFrame, meta: dict):
-    os.makedirs(_run_path(run_id), exist_ok=True)
-    df.to_csv(_data_path(run_id), index=False)
-    meta["updated"] = utc_now()
-    json.dump(meta, open(_meta_path(run_id), "w"), indent=2)
 
-def load_run(run_id):
-    df = pd.read_csv(_data_path(run_id))
-    meta = json.load(open(_meta_path(run_id), "r"))
+def save_run(run_id: str, df: pd.DataFrame, meta: dict):
+    os.makedirs(_run_path(run_id), exist_ok=True)
+    df.to_csv(_data_path(run_id), index=False, encoding="utf-8")
+    meta["updated_at"] = utc_now_str()
+    with open(_meta_path(run_id), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+
+def load_run(run_id: str):
+    df = pd.read_csv(_data_path(run_id), dtype=str).fillna("")
+    with open(_meta_path(run_id), "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    if "Rank" in df.columns:
+        with pd.option_context("mode.chained_assignment", None):
+            df["Rank"] = pd.to_numeric(df["Rank"], errors="coerce").fillna(0).astype(int)
     return df, meta
 
-def new_meta(name: str, url: str):
-    now = utc_now()
-    return {"name": name or "Top 20", "url": url or "", "created": now, "updated": now}
 
-# ========================= Session State =========================
-if "df" not in st.session_state: st.session_state.df = None
-if "meta" not in st.session_state: st.session_state.meta = None
-if "delay_min" not in st.session_state: st.session_state.delay_min = 1.0
-if "delay_max" not in st.session_state: st.session_state.delay_max = 2.0
-if "debug" not in st.session_state: st.session_state.debug = False
+def make_meta(category_desc: str, amazon_url: str, fetched_at: str) -> dict:
+    now = utc_now_str()
+    return {
+        "name": category_desc or "Top 20",
+        "category_desc": category_desc or "",
+        "amazon_url": amazon_url or "",
+        "fetched_at": fetched_at or now,
+        "created_at": now,
+        "updated_at": now,
+    }
 
-# ========================= Sidebar (Saved Searches) =========================
-st.sidebar.header("Saved Searches")
-saved = list_saved()
-choices = ["(none)"] + [f"{r['name']} — {r.get('updated','')}" for r in saved]
-sel = st.sidebar.selectbox("Select a saved search", choices, index=0)
 
-col_sb1, col_sb2 = st.sidebar.columns(2)
-if col_sb1.button("Load"):
-    if sel != "(none)":
-        ridx = choices.index(sel) - 1
-        run = saved[ridx]
-        df, meta = load_run(run["id"])
-        st.session_state.df = df
-        st.session_state.meta = meta
-        st.success(f"Loaded “{meta.get('name','Top 20')}”")
+# ====================================================
+# Session state
+# ====================================================
 
-if col_sb2.button("Delete"):
-    if sel != "(none)":
-        ridx = choices.index(sel) - 1
-        run = saved[ridx]
-        import shutil
-        shutil.rmtree(_run_path(run["id"]), ignore_errors=True)
-        st.warning("Deleted. Refreshing list…")
-        st.rerun()
+if "results" not in st.session_state:
+    st.session_state.results = None
+if "current_run_id" not in st.session_state:
+    st.session_state.current_run_id = None
+if "current_meta" not in st.session_state:
+    st.session_state.current_meta = None
+if "view_mode" not in st.session_state:
+    st.session_state.view_mode = "Grid (4x5)"
 
-st.sidebar.caption("Dropdown + Load/Delete only to keep this clean.")
 
-# ========================= Top Toolbar =========================
-st.markdown(CARD_CSS, unsafe_allow_html=True)
+# ====================================================
+# Sidebar: Saved Searches (simple & clean)
+# ====================================================
 
-toolbar = st.container()
-with toolbar:
-    c1, c2, c3, c4 = st.columns([1.2, 1.4, 1.8, 2.6])
+with st.sidebar:
+    st.header("Saved Searches")
 
-    fetch_clicked = c1.button("Fetch Top 20", type="primary")
-    download_placeholder = c2.empty()
-
-    view_mode = c3.radio("View Mode", ["List", "Grid", "Compact"], horizontal=True, label_visibility="visible")
-
-    with c4.expander("⚙️ Settings", expanded=False):
-        st.session_state.delay_min = st.slider(
-            "Min per-item delay (sec)", 0.3, 5.0, st.session_state.delay_min, 0.1, key="delay_min_slider"
+    saved = list_saved_runs()
+    if saved:
+        labels = [f"{r['name']}  —  {r.get('updated_at','')}" for r in saved]
+        sel_idx = st.selectbox(
+            "Saved runs",
+            options=list(range(len(saved))),
+            format_func=lambda i: labels[i],
         )
-        st.session_state.delay_max = st.slider(
-            "Max per-item delay (sec)", 0.4, 6.0, st.session_state.delay_max, 0.1, key="delay_max_slider"
-        )
-        st.session_state.debug = st.checkbox("Debug logging (basic)", value=st.session_state.debug)
+        sel = saved[sel_idx]
 
-# ========================= Inputs (below toolbar) =========================
-url = st.text_input("Amazon Best Sellers URL", placeholder="https://www.amazon.com/gp/bestsellers/pc/17441247011")
-name = st.text_input("Category Name (for saving/export)", placeholder="e.g., Single Board Computers")
-
-# ========================= Fetch Handler =========================
-if fetch_clicked:
-    if not re.match(r"^https?://", (url or "").strip(), re.I):
-        st.error("Please enter a valid URL starting with http:// or https://")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Load"):
+                df, meta = load_run(sel["id"])
+                st.session_state.results = df
+                st.session_state.current_run_id = sel["id"]
+                st.session_state.current_meta = meta
+                st.success(f"Loaded: {meta.get('name')}")
+        with c2:
+            if st.button("Delete"):
+                import shutil
+                try:
+                    shutil.rmtree(_run_path(sel["id"]), ignore_errors=True)
+                    st.warning("Deleted. Refreshing list…")
+                    st.experimental_rerun()
+                except Exception as e:
+                    st.error(f"Delete failed: {e}")
     else:
-        s = _session()
+        st.caption("No saved searches yet.")
+
+    with st.expander("Scrape Settings", expanded=False):
+        st.caption("Adjust delays if Amazon gets cranky.")
+        dmin = st.slider("Min per-item delay (sec)", 0.5, 5.0, 1.0, 0.1, key="dmin")
+        dmax = st.slider("Max per-item delay (sec)", 0.6, 6.0, 2.0, 0.1, key="dmax")
+        if dmax < dmin:
+            st.session_state.dmax = dmin + 0.1
+
+
+# ====================================================
+# Main layout
+# ====================================================
+
+st.title("Amazon Top-20 Scraper → Excel Layout")
+
+# ---------- Top control bar ----------
+top_bar = st.container()
+with top_bar:
+    col_bar = st.columns([1.2, 1.2, 1.6, 2.5, 2.5])
+    with col_bar[0]:
+        fetch_btn = st.button("Fetch Top 20", type="primary")
+    with col_bar[1]:
+        save_as_new_btn = st.button("Save as New", disabled=(st.session_state.results is None))
+    with col_bar[2]:
+        export_placeholder = st.empty()
+    with col_bar[3]:
+        st.session_state.view_mode = st.radio(
+            "View",
+            options=["Grid (4x5)", "List"],
+            horizontal=True,
+            label_visibility="visible",
+        )
+    with col_bar[4]:
+        st.markdown("")  # spacer
+
+# ---------- Inputs under top bar ----------
+col_in1, col_in2 = st.columns([3, 2])
+with col_in1:
+    amz_url = st.text_input(
+        "Amazon Best Sellers URL",
+        placeholder="https://www.amazon.com/gp/bestsellers/pc/17441247011",
+    )
+with col_in2:
+    category_desc = st.text_input(
+        "Short internal name (for saved searches)",
+        placeholder="Single Board Computers",
+    )
+
+# ====================================================
+# Fetch handler
+# ====================================================
+
+if fetch_btn:
+    if not amz_url.strip():
+        st.error("Please enter a full Amazon Best Sellers URL.")
+    else:
+        session = _session()
+        st.info("Fetching top 20 items from Amazon...")
         try:
-            items = parse_top20(url.strip(), s)
+            items = parse_top20_from_category_page(amz_url.strip(), session=session)
         except Exception as e:
-            st.error(f"Failed to fetch list: {e}")
+            st.error(f"Failed to fetch/parse Amazon page: {e}")
             items = []
 
-        out = []
-        total = len(items)
-        status = st.empty()
-        progress = st.progress(0) if total else None
-
-        for i, it in enumerate(items, start=1):
-            status.write(f"Fetching item {i} of {total}…")
-            price, image, sell = fetch_details(
-                it["URL"], s, delay=(st.session_state.delay_min, st.session_state.delay_max)
-            )
-            out.append({
-                "Rank": i,
-                "Title": it["Title"],
-                "ASIN": it["ASIN"],
-                "URL": it["URL"],
-                "Price": price,
-                "Image": image,
-                "Sell": sell,
-                # MC fields for Data tab
-                "MCSKU": "",
-                "MCTitle": "",
-                "MCRetail": "",
-                "MCCost": "",
-                "Avg1_4": "",
-                "Attributes": "",
-                "Notes": "",
-            })
-            if progress:
-                progress.progress(int(i / max(1, total) * 100))
-            time.sleep(random.uniform(st.session_state.delay_min, st.session_state.delay_max))
-
-        if progress:
-            progress.empty()
-        status.success("Top 20 fetched!")
-
-        st.session_state.df = pd.DataFrame(out)
-        st.session_state.meta = new_meta(name or "Top 20", url.strip())
-
-        # auto-save this run so it appears in sidebar
-        run_id = uuid.uuid4().hex[:12]
-        save_run(run_id, st.session_state.df, st.session_state.meta)
-
-        st.rerun()  # refresh sidebar list
-
-# ========================= Display Results (no re-scrape on view switch) =========================
-def render_list(df: pd.DataFrame):
-    for _, r in df.iterrows():
-        st.markdown(f"### #{r['Rank']} — {r['Title']}")
-        cols = st.columns([1, 3])
-        with cols[0]:
-            img_bytes = _download_image_bytes(r["Image"], max_px=160)
-            if img_bytes:
-                st.image(img_bytes, width=120)
-            else:
-                st.write("—")
-        with cols[1]:
-            if r["Price"]:
-                st.write(r["Price"])
-            if r["Sell"]:
-                st.caption(r["Sell"])
-            st.write(f"[Open on Amazon]({r['URL']})")
-        st.divider()
-
-def render_cards(df: pd.DataFrame, imgw: int):
-    ncols = 5
-    chunks = [df.iloc[i:i + ncols] for i in range(0, len(df), ncols)]
-    # pad to always show 4 rows of 5 (20 slots) visually, if fewer just empty cells
-    for row_idx in range(4):  # 4 rows
-        cols = st.columns(ncols)
-        if row_idx < len(chunks):
-            row = chunks[row_idx]
+        if not items:
+            st.warning("No items parsed. Amazon might have changed the layout or blocked the request.")
         else:
-            row = pd.DataFrame()  # empty
+            rows = []
+            ts = utc_now_str()
+            for idx, it in enumerate(items):
+                rows.append(
+                    {
+                        "ImageURL": it.get("ImageURL", ""),
+                        "Rank": idx + 1,
+                        "Title": it.get("Title", ""),
+                        "ASIN": it.get("ASIN", ""),
+                        "AmazonURL": it.get("URL", ""),
+                        "AmazonPrice": it.get("AmazonPrice", ""),
+                        "AmazonSellThru": it.get("AmazonSellThru", ""),
+                        # MC fields for later manual use in Excel:
+                        "MCSKU": "",
+                        "MCTitle": "",
+                        "MCRetail": "",
+                        "MCCost": "",
+                        "Avg1_4": "",
+                        "AttrMatch": "",
+                        "Notes": "",
+                        # Meta:
+                        "FetchedAt": ts,
+                        "CategoryDesc": category_desc.strip(),
+                        "AmazonBestURL": amz_url.strip(),
+                    }
+                )
+                time.sleep(random.uniform(st.session_state.dmin, st.session_state.dmax))
 
-        for c_idx, c in enumerate(cols):
-            if row_idx < len(chunks) and c_idx < len(row):
-                r = row.iloc[c_idx]
-                img_bytes = _download_image_bytes(r["Image"], max_px=imgw)
-                html = "<div class='card'>"
-                html += f"<div class='rankbar'>#{r['Rank']}</div><br>"
-                if img_bytes:
-                    # streamlit will convert bytes to a media URL, but we can just use st.image inside the card column
-                    pass
-                html += f"<div class='title'>{r['Title']}</div>"
-                if r["Price"]:
-                    html += f"<div class='price'>{r['Price']}</div>"
-                if r["Sell"]:
-                    html += f"<div class='sell'>{r['Sell']}</div>"
-                html += f"<div class='meta'><a href='{r['URL']}' target='_blank'>Open on Amazon</a></div>"
-                html += "</div>"
-                c.markdown(html, unsafe_allow_html=True)
-                # show image above the card HTML (keeps layout simple)
-                if img_bytes:
-                    c.image(img_bytes, width=imgw)
-            else:
-                # empty slot (to keep 5 columns)
-                c.write("")
-        st.write("")
-
-if st.session_state.df is not None:
-    df = st.session_state.df.copy()
-    if view_mode == "List":
-        render_list(df)
-    elif view_mode == "Grid":
-        render_cards(df, imgw=120)
-    else:
-        render_cards(df, imgw=80)
-
-# ========================= Excel Export (Top 20 + Data) =========================
-def build_xlsx(df: pd.DataFrame) -> bytes:
-    wb = Workbook()
-    ws_top = wb.active
-    ws_top.title = "Top 20"
-    ws_data = wb.create_sheet("Data")
-
-    # Data columns order (includes sell-through + MC fields)
-    cols = [
-        "Rank", "ASIN", "URL", "Image", "Title", "Price", "Sell",
-        "MCSKU", "MCTitle", "MCRetail", "MCCost", "Avg1_4", "Attributes", "Notes",
-    ]
-    for j, c in enumerate(cols, 1):
-        ws_data.cell(row=1, column=j, value=c)
-    for i, r in enumerate(df.itertuples(index=False), start=2):
-        ws_data.cell(i, 1, r.Rank)
-        ws_data.cell(i, 2, r.ASIN)
-        ws_data.cell(i, 3, r.URL)
-        ws_data.cell(i, 4, r.Image)
-        ws_data.cell(i, 5, r.Title)
-        ws_data.cell(i, 6, r.Price)
-        ws_data.cell(i, 7, r.Sell)
-        ws_data.cell(i, 8, r.MCSKU)
-        ws_data.cell(i, 9, r.MCTitle)
-        ws_data.cell(i,10, r.MCRetail)
-        ws_data.cell(i,11, r.MCCost)
-        ws_data.cell(i,12, r.Avg1_4)
-        ws_data.cell(i,13, r.Attributes)
-        ws_data.cell(i,14, r.Notes)
-
-    for j in range(1, len(cols) + 1):
-        ws_data.column_dimensions[get_column_letter(j)].width = 22
-    ws_data.freeze_panes = "A2"
-
-    # Top 20 sheet layout: 5 columns, 4 groups (20 slots)
-    for c in range(1, 6):
-        ws_top.column_dimensions[get_column_letter(c)].width = EXCEL_COL_WIDTH
-
-    wrap_top = Alignment(wrap_text=True, vertical="top")
-    center_mid = Alignment(horizontal="center", vertical="center")
-
-    ITEMS_PER_ROW = 5
-    ROW_BLOCK = 12  # rank + image + 10 info lines
-
-    def data_ref(col_idx, drow):
-        return f"Data!{get_column_letter(col_idx)}{drow}"
-
-    max_items = min(20, len(df))
-    for idx in range(max_items):
-        group = idx // ITEMS_PER_ROW
-        col = (idx % ITEMS_PER_ROW) + 1
-        base = group * ROW_BLOCK + 1
-        drow = idx + 2  # row in Data
-
-        # Rank bar
-        rank_val = df.iloc[idx]["Rank"]
-        rank_cell = ws_top.cell(row=base, column=col, value=f"Rank #{rank_val}")
-        rank_cell.fill = RANK_FILL
-        rank_cell.font = WHITE_FONT
-        rank_cell.alignment = center_mid
-        rank_cell.border = BORDER_BOX
-
-        # Image row
-        ws_top.row_dimensions[base + 1].height = EXCEL_IMG_ROW_HEIGHT
-        img_url = df.iloc[idx]["Image"]
-        img_buf = _download_image_bytes(img_url, EXCEL_IMG_MAX_PX)
-        if img_buf:
-            xl = XLImage(img_buf)
-            xl.anchor = f"{get_column_letter(col)}{base + 1}"
-            ws_top.add_image(xl)
-        img_cell = ws_top.cell(row=base + 1, column=col, value=" ")
-        img_cell.border = BORDER_BOX
-
-        # Info lines (linked to Data tab)
-        info = [
-            ("Amazon",     5),  # Title
-            ("Price",      6),
-            ("Sell",       7),
-            ("MC SKU",     8),
-            ("MC Title",   9),
-            ("MC Retail", 10),
-            ("MC Cost",   11),
-            ("1-4 Avg",   12),
-            ("Attributes",13),
-            ("Notes",     14),
-        ]
-        for r_off, (label, dcol) in enumerate(info, start=2):
-            cell = ws_top.cell(
-                row=base + r_off, column=col,
-                value=f'=CONCAT("{label}: ", {data_ref(dcol, drow)})'
+            df = pd.DataFrame(
+                rows,
+                columns=[
+                    "ImageURL",
+                    "Rank",
+                    "Title",
+                    "ASIN",
+                    "AmazonURL",
+                    "AmazonPrice",
+                    "AmazonSellThru",
+                    "MCSKU",
+                    "MCTitle",
+                    "MCRetail",
+                    "MCCost",
+                    "Avg1_4",
+                    "AttrMatch",
+                    "Notes",
+                    "FetchedAt",
+                    "CategoryDesc",
+                    "AmazonBestURL",
+                ],
             )
-            cell.alignment = wrap_top
-            cell.border = BORDER_BOX
+            st.session_state.results = df
+            st.session_state.current_run_id = None
+            st.session_state.current_meta = None
+            st.success("Top 20 fetched!")
 
-    mem = BytesIO()
-    wb.save(mem)
-    mem.seek(0)
-    return mem.read()
+# ====================================================
+# Save-as-new handler
+# ====================================================
 
-if st.session_state.df is not None:
-    meta = st.session_state.meta or {"name": "Top_20"}
-    with toolbar:
-        download_placeholder.download_button(
-            "Download Excel",
-            data=build_xlsx(st.session_state.df),
-            file_name=f"{(meta.get('name') or 'Top_20').replace(' ','_')}_Top20.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+if save_as_new_btn and st.session_state.results is not None:
+    df = st.session_state.results
+    cat = df.iloc[0].get("CategoryDesc", "") if not df.empty else category_desc
+    url_meta = df.iloc[0].get("AmazonBestURL", "") if not df.empty else amz_url
+    fetched_at = df.iloc[0].get("FetchedAt", utc_now_str()) if not df.empty else utc_now_str()
+    meta = make_meta(cat, url_meta, fetched_at)
+    run_id = uuid.uuid4().hex[:12]
+    save_run(run_id, df, meta)
+    st.session_state.current_run_id = run_id
+    st.session_state.current_meta = meta
+    st.success(f"Saved as new: {meta['name']}")
+    st.experimental_rerun()
+
+# ====================================================
+# Display results (List / Grid) — no re-scrape on view change
+# ====================================================
+
+df = st.session_state.results
+
+if df is not None and not df.empty:
+    meta = st.session_state.current_meta or {
+        "name": df.iloc[0].get("CategoryDesc") or "Top 20",
+        "fetched_at": df.iloc[0].get("FetchedAt"),
+        "amazon_url": df.iloc[0].get("AmazonBestURL"),
+    }
+
+    # Header info
+    hdr_cols = st.columns([3, 2, 2])
+    with hdr_cols[0]:
+        st.subheader(meta.get("name", "Top 20"))
+    with hdr_cols[1]:
+        st.caption(f"Pulled at: {meta.get('fetched_at', '')}")
+    with hdr_cols[2]:
+        if meta.get("amazon_url"):
+            st.caption(f"[Source: Amazon Best Sellers]({meta['amazon_url']})")
+
+    st.markdown(
+        """
+        <style>
+        .tight p { margin: 0.1rem 0 !important; }
+        .tiny { font-size: 0.8rem; color: #6b7280; }
+        .price { font-weight: 600; }
+        .card {
+            background-color: #ffffff;
+            border-radius: 8px;
+            border: 1px solid #e5e7eb;
+            padding: 0.5rem;
+            box-shadow: 0 1px 2px rgba(15,23,42,0.05);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ---------- List view ----------
+    if st.session_state.view_mode == "List":
+        for _, row in df.iterrows():
+            c1, c2 = st.columns([1, 5])
+            with c1:
+                if isinstance(row["ImageURL"], str) and row["ImageURL"]:
+                    st.image(row["ImageURL"], width=120)
+                else:
+                    st.write("—")
+            with c2:
+                st.markdown(
+                    f"<div class='card tight'>"
+                    f"<b>#{int(row['Rank'])}</b> &nbsp; {row['Title'] or '(no title)'}<br>"
+                    f"<span class='price'>{row['AmazonPrice'] or ''}</span>"
+                    f"{' &nbsp; • &nbsp; ' + row['AmazonSellThru'] if row['AmazonSellThru'] else ''}<br>"
+                    f"<span class='tiny'>ASIN: {row['ASIN']} &nbsp;|&nbsp; "
+                    f"<a href='{row['AmazonURL']}' target='_blank'>Amazon Link</a></span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            st.markdown("---")
+
+    # ---------- Grid view (4 rows x 5 columns) ----------
+    else:
+        top20 = df.head(20).reset_index(drop=True)
+        num_items = len(top20)
+        # 4 rows of cards, 5 per row (20 total)
+        for row_idx in range(0, num_items, ITEMS_PER_ROW):
+            cols = st.columns(ITEMS_PER_ROW)
+            for col_offset in range(ITEMS_PER_ROW):
+                idx = row_idx + col_offset
+                if idx >= num_items:
+                    continue
+                row = top20.iloc[idx]
+                with cols[col_offset]:
+                    st.markdown("<div class='card'>", unsafe_allow_html=True)
+                    if isinstance(row["ImageURL"], str) and row["ImageURL"]:
+                        st.image(row["ImageURL"], use_column_width="auto")
+                    st.markdown(
+                        f"<div class='tight'>"
+                        f"<b># {int(row['Rank'])}</b><br>"
+                        f"{row['Title'] or '(no title)'}<br>"
+                        f"<span class='price'>{row['AmazonPrice'] or ''}</span><br>"
+                        f"{row['AmazonSellThru'] if row['AmazonSellThru'] else ''}<br>"
+                        f"<span class='tiny'>ASIN: {row['ASIN']}</span><br>"
+                        f"<span class='tiny'><a href='{row['AmazonURL']}' target='_blank'>Amazon Link</a></span>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown("</div>", unsafe_allow_html=True)
+
+    # ====================================================
+    # Excel export builder (Data + Top 20 layout)
+    # ====================================================
+
+    def _download_image_bytes(url: str, max_px: int = EXCEL_IMG_MAX_PX) -> Optional[BytesIO]:
+        """
+        Fetch & resize image; return PNG bytes or None if failed.
+        Small retry to reduce random drops.
+        """
+        if not url or not isinstance(url, str):
+            return None
+        for attempt in range(2):
+            try:
+                resp = requests.get(url, headers={"User-Agent": random.choice(USER_AGENTS)}, timeout=15)
+                resp.raise_for_status()
+                img = PILImage.open(BytesIO(resp.content)).convert("RGBA")
+                img.thumbnail((max_px, max_px), PILImage.LANCZOS)
+                buff = BytesIO()
+                img.save(buff, format="PNG")
+                buff.seek(0)
+                return buff
+            except Exception:
+                if attempt == 1:
+                    return None
+                time.sleep(0.5)
+        return None
+
+    def build_xlsx(df_src: pd.DataFrame) -> bytes:
+        wb = Workbook()
+        ws_top = wb.active
+        ws_top.title = "Top 20"
+        ws_data = wb.create_sheet("Data")
+
+        # ----- Data sheet -----
+        cols = [
+            "Rank",            # 1
+            "ASIN",            # 2
+            "AmazonURL",       # 3
+            "ImageURL",        # 4
+            "Title",           # 5
+            "AmazonPrice",     # 6
+            "AmazonSellThru",  # 7
+            "MCSKU",           # 8
+            "MCTitle",         # 9
+            "MCRetail",        #10
+            "MCCost",          #11
+            "Avg1_4",          #12
+            "AttrMatch",       #13
+            "Notes",           #14
+            "FetchedAt",       #15
+            "CategoryDesc",    #16
+            "AmazonBestURL",   #17
+        ]
+        for j, c in enumerate(cols, start=1):
+            ws_data.cell(row=1, column=j, value=c)
+
+        top20 = df_src.head(20).reset_index(drop=True)
+        for i, r in top20.iterrows():
+            values = [
+                int(r.get("Rank", i + 1)),
+                r.get("ASIN", ""),
+                r.get("AmazonURL", ""),
+                r.get("ImageURL", ""),
+                r.get("Title", ""),
+                r.get("AmazonPrice", ""),
+                r.get("AmazonSellThru", ""),
+                r.get("MCSKU", ""),
+                r.get("MCTitle", ""),
+                r.get("MCRetail", ""),
+                r.get("MCCost", ""),
+                r.get("Avg1_4", ""),
+                r.get("AttrMatch", ""),
+                r.get("Notes", ""),
+                r.get("FetchedAt", ""),
+                r.get("CategoryDesc", ""),
+                r.get("AmazonBestURL", ""),
+            ]
+            for j, v in enumerate(values, start=1):
+                ws_data.cell(row=2 + i, column=j, value=v)
+
+        data_widths = [8, 12, 30, 30, 50, 12, 18, 12, 50, 12, 12, 12, 20, 30, 20, 24, 32]
+        for j, w in enumerate(data_widths, start=1):
+            ws_data.column_dimensions[get_column_letter(j)].width = w
+        ws_data.freeze_panes = "A2"
+
+        # ----- Top 20 layout -----
+        for c in range(1, ITEMS_PER_ROW + 1):
+            ws_top.column_dimensions[get_column_letter(c)].width = EXCEL_COL_WIDTH
+
+        left_wrap = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        left_mid = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        center_mid = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        thin = Side(style="thin", color="DDDDDD")
+        box = Border(left=thin, right=thin, top=thin, bottom=thin)
+        band1 = PatternFill("solid", fgColor=BAND_COLOR_1)
+        band2 = PatternFill("solid", fgColor=BAND_COLOR_2)
+        rank_fill = PatternFill("solid", fgColor=RANK_BGCOLOR)
+        rank_font = Font(bold=True, color=RANK_FGCOLOR)
+        bold = Font(bold=True)
+
+        def DREF(col_idx: int, data_row: int) -> str:
+            return f"Data!{get_column_letter(col_idx)}{data_row}"
+
+        for idx in range(len(top20)):
+            group = idx // ITEMS_PER_ROW
+            col = 1 + (idx % ITEMS_PER_ROW)
+            base = 1 + group * BLOCK_ROWS
+            data_row = 2 + idx
+
+            band_fill = band1 if (group % 2 == 0) else band2
+
+            # Image row
+            img_url = ws_data.cell(row=data_row, column=4).value
+            amz_url = ws_data.cell(row=data_row, column=3).value
+
+            img_buf = _download_image_bytes(img_url, max_px=EXCEL_IMG_MAX_PX)
+            if img_buf:
+                xl_img = XLImage(img_buf)
+                xl_img.anchor = f"{get_column_letter(col)}{base}"
+                ws_top.add_image(xl_img)
+
+            cell = ws_top.cell(row=base, column=col, value=" ")
+            if amz_url:
+                cell.hyperlink = amz_url
+            cell.alignment = center_mid
+            cell.border = box
+            cell.fill = band_fill
+            ws_top.row_dimensions[base].height = EXCEL_IMG_ROW_HEIGHT
+
+            # Rank row (with colored background)
+            c = ws_top.cell(row=base + 1, column=col, value=f'= "Rank: #" & {DREF(1, data_row)}')
+            c.alignment = left_mid
+            c.font = rank_font
+            c.border = box
+            c.fill = rank_fill
+
+            # Amazon title
+            c = ws_top.cell(row=base + 2, column=col, value=f'= "Amazon: " & {DREF(5, data_row)}')
+            c.alignment = left_wrap
+            c.border = box
+            c.fill = band_fill
+
+            # Amazon price
+            c = ws_top.cell(row=base + 3, column=col, value=f'= "Amazon Price: " & {DREF(6, data_row)}')
+            c.alignment = left_mid
+            c.font = bold
+            c.border = box
+            c.fill = band_fill
+
+            # Sell-through
+            c = ws_top.cell(row=base + 4, column=col, value=f'= "Sell-through: " & {DREF(7, data_row)}')
+            c.alignment = left_mid
+            c.border = box
+            c.fill = band_fill
+
+            # MC SKU
+            c = ws_top.cell(row=base + 5, column=col, value=f'= "MC SKU: " & {DREF(8, data_row)}')
+            c.alignment = left_mid
+            c.border = box
+            c.fill = band_fill
+
+            # MC Title
+            c = ws_top.cell(row=base + 6, column=col, value=f'= "MC Title: " & {DREF(9, data_row)}')
+            c.alignment = left_wrap
+            c.border = box
+            c.fill = band_fill
+
+            # MC Retail
+            c = ws_top.cell(row=base + 7, column=col, value=f'= "MC Retail: " & {DREF(10, data_row)}')
+            c.alignment = left_mid
+            c.font = bold
+            c.border = box
+            c.fill = band_fill
+
+            # MC Cost
+            c = ws_top.cell(row=base + 8, column=col, value=f'= "MC Cost: " & {DREF(11, data_row)}')
+            c.alignment = left_mid
+            c.border = box
+            c.fill = band_fill
+
+            # 1–4 Avg
+            c = ws_top.cell(row=base + 9, column=col, value=f'= "1-4 Avg: " & {DREF(12, data_row)}')
+            c.alignment = left_mid
+            c.border = box
+            c.fill = band_fill
+
+            # Attributes
+            c = ws_top.cell(row=base + 10, column=col, value=f'= "Attributes: " & {DREF(13, data_row)}')
+            c.alignment = left_wrap
+            c.border = box
+            c.fill = band_fill
+
+            # Notes
+            c = ws_top.cell(row=base + 11, column=col, value=f'= "Notes: " & {DREF(14, data_row)}')
+            c.alignment = left_wrap
+            c.border = box
+            c.fill = band_fill
+
+        ws_top.freeze_panes = None  # no freeze on Top 20 sheet
+
+        bio = BytesIO()
+        wb.save(bio)
+        bio.seek(0)
+        return bio.read()
+
+    # Single download button in the top bar
+    export_placeholder.download_button(
+        "Download Excel",
+        data=build_xlsx(df),
+        file_name=f"{(meta.get('name') or 'Top20').replace(' ', '_')}_Top20.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
+
+else:
+    st.info("Enter an Amazon Best Sellers URL and click **Fetch Top 20** to begin.")
