@@ -1,5 +1,5 @@
 #######################################################################
-# FULL APP.PY — Amazon Top-20 Scraper (with Image Proxy)
+# FULL APP.PY — Amazon Top-20 Scraper (Streamlit Cloud Safe Version)
 #######################################################################
 
 import os
@@ -20,7 +20,6 @@ import streamlit as st
 
 from PIL import Image as PILImage
 from openpyxl import Workbook
-from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -36,37 +35,27 @@ SAVED_DIR = ".saved_searches"
 os.makedirs(SAVED_DIR, exist_ok=True)
 
 #######################################################################
-# IMAGE PROXY SERVER (FastAPI Mounted in Thread)
+# STREAMLIT-SAFE IMAGE CACHE (no external server)
 #######################################################################
-from fastapi import FastAPI
-from fastapi.responses import Response
-import uvicorn
-import threading
+@st.cache_data(show_spinner=False)
+def load_image(url):
+    """Download image → convert to PIL → cache result.
+       This prevents dropped images in Streamlit Cloud.
+    """
+    if not url:
+        return None
+    try:
+        r = requests.get(
+            url,
+            headers={"User-Agent": random.choice(USER_AGENTS)},
+            timeout=10,
+        )
+        r.raise_for_status()
+        img = PILImage.open(BytesIO(r.content)).convert("RGB")
+        return img
+    except Exception:
+        return None
 
-if "api_started" not in st.session_state:
-    api = FastAPI()
-
-    @api.get("/img")
-    def proxy_image(url: str):
-        """
-        Server-side download → convert → return stable PNG.
-        Completely stops Streamlit image drops.
-        """
-        try:
-            r = requests.get(url, headers={"User-Agent": random.choice(USER_AGENTS)}, timeout=10)
-            r.raise_for_status()
-            img = PILImage.open(BytesIO(r.content)).convert("RGB")
-            buf = BytesIO()
-            img.save(buf, format="PNG")
-            return Response(buf.getvalue(), media_type="image/png")
-        except Exception:
-            return Response(status_code=404)
-
-    def _run_proxy():
-        uvicorn.run(api, host="0.0.0.0", port=9000, log_level="error")
-
-    threading.Thread(target=_run_proxy, daemon=True).start()
-    st.session_state.api_started = True
 
 #######################################################################
 # HELPERS
@@ -131,9 +120,7 @@ def extract_price(soup):
     return ""
 
 def extract_sell(soup):
-    # “9K+ bought in past month”
     pat = re.compile(r"(\d[\dK\+\,\.]*\s*\+?\s*bought.*past\s+month)", re.I)
-
     for el in soup.find_all(["div", "span"], string=pat):
         txt = el.get_text(strip=True)
         if txt:
@@ -203,7 +190,7 @@ if "delay_min" not in st.session_state: st.session_state.delay_min = 1.0
 if "delay_max" not in st.session_state: st.session_state.delay_max = 2.0
 
 #######################################################################
-# SIDEBAR — Clean Saved Searches
+# SIDEBAR — Saved Searches
 #######################################################################
 st.sidebar.header("Saved Searches")
 
@@ -227,16 +214,16 @@ if col_d.button("Delete"):
         import shutil
         shutil.rmtree(run_path(rid), ignore_errors=True)
         st.warning("Deleted. Refreshing...")
-        st.rerun()
+        st.experimental_rerun()
 
 #######################################################################
 # TOP TOOLBAR
 #######################################################################
 st.title("Amazon Top-20 Scraper")
 
-tb = st.container()
-with tb:
-    c1, c2, c3, c4 = st.columns([1.2, 1.4, 1.7, 2.7])
+bar = st.container()
+with bar:
+    c1, c2, c3, c4 = st.columns([1.2, 1.4, 1.6, 3])
     fetch_btn = c1.button("Fetch Top 20", type="primary")
     download_placeholder = c2.empty()
 
@@ -247,7 +234,7 @@ with tb:
         st.session_state.delay_max = st.slider("Max Delay", 0.3, 6.0, st.session_state.delay_max)
 
 #######################################################################
-# INPUTS
+# INPUT FIELDS
 #######################################################################
 url = st.text_input("Amazon Best Sellers URL")
 name = st.text_input("Category Name")
@@ -280,7 +267,6 @@ if fetch_btn:
                 "Price": price,
                 "Image": img,
                 "Sell": sell,
-                # data sheet fields
                 "MCSKU": "", "MCTitle": "", "MCRetail": "",
                 "MCCost": "", "Avg1_4": "",
                 "Attributes": "", "Notes": "",
@@ -298,29 +284,8 @@ if fetch_btn:
         }
 
 #######################################################################
-# RENDER RESULTS
+# RENDERING
 #######################################################################
-def proxy(url):
-    if not url:
-        return ""
-    return f"http://localhost:9000/img?url={url}"  # always stable
-
-# --- List View ---
-def render_list(df):
-    for _, r in df.iterrows():
-        cols = st.columns([1, 4])
-        with cols[0]:
-            st.markdown(f"<img src='{proxy(r['Image'])}' width='100'/>", unsafe_allow_html=True)
-        with cols[1]:
-            st.markdown(f"<b>#{r['Rank']}</b> — {r['Title']}")
-            if r["Price"]:
-                st.markdown(f"<span style='color:#B12704;font-weight:800'>{r['Price']}</span>", unsafe_allow_html=True)
-            if r["Sell"]:
-                st.caption(r["Sell"])
-            st.markdown(f"[Amazon Link]({r['URL']})")
-        st.markdown("<hr/>", unsafe_allow_html=True)
-
-# --- Grid / Compact ---
 GRID_CSS = """
 <style>
 .card{
@@ -350,15 +315,33 @@ GRID_CSS = """
 """
 st.markdown(GRID_CSS, unsafe_allow_html=True)
 
+def render_list(df):
+    for _, r in df.iterrows():
+        cols = st.columns([1, 4])
+        with cols[0]:
+            img = load_image(r["Image"])
+            if img:
+                st.image(img, width=100)
+        with cols[1]:
+            st.markdown(f"<b>#{r['Rank']}</b> — {r['Title']}")
+            if r["Price"]:
+                st.markdown(f"<span style='color:#B12704;font-weight:800'>{r['Price']}</span>", unsafe_allow_html=True)
+            if r["Sell"]:
+                st.caption(r["Sell"])
+            st.markdown(f"[Amazon Link]({r['URL']})")
+        st.divider()
+
 def render_grid(df, imgw):
     ncols = 5
     rows = [df.iloc[i:i+ncols] for i in range(0, len(df), ncols)]
     for row in rows:
         cols = st.columns(ncols)
         for c, (_, r) in zip(cols, row.iterrows()):
+            img = load_image(r["Image"])
             html = "<div class='card'>"
             html += f"<div class='rank'>#{r['Rank']}</div>"
-            html += f"<img src='{proxy(r['Image'])}' width='{imgw}'/>"
+            if img:
+                c.image(img, width=imgw)
             html += f"<div class='title'>{r['Title']}</div>"
             if r["Price"]:
                 html += f"<div class='price'>{r['Price']}</div>"
@@ -368,6 +351,9 @@ def render_grid(df, imgw):
             html += "</div>"
             c.markdown(html, unsafe_allow_html=True)
 
+#######################################################################
+# SHOW RESULTS
+#######################################################################
 if st.session_state.df is not None:
     df = st.session_state.df.head(20)
 
@@ -379,14 +365,13 @@ if st.session_state.df is not None:
         render_grid(df, imgw=80)
 
 #######################################################################
-# EXCEL EXPORT
+# EXCEL EXPORT (unchanged)
 #######################################################################
 def build_excel(df):
     wb = Workbook()
     ws = wb.active
     ws.title = "Top 20"
 
-    # Simple data dump
     cols = ["Rank","ASIN","URL","Image","Title","Price","Sell",
             "MCSKU","MCTitle","MCRetail","MCCost","Avg1_4","Attributes","Notes"
     ]
